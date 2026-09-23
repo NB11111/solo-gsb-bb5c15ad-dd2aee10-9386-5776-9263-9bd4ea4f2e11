@@ -72,8 +72,33 @@ class MergeOp(BaseModel):
         return self
 
 
+class DisposeItemIn(BaseModel):
+    """销毁明细:对指定样品销毁 amount,逐项必填报废原因。"""
+
+    sample_id: str = Field(min_length=1)
+    amount: Amount
+    reason: str = Field(min_length=1, description="销毁/报废原因,逐项写入不可变审计记录")
+
+
+class DisposeOp(BaseModel):
+    """销毁/报废:一次提交多个样品的销毁量,校验可用量(余量-未释放预留)。"""
+
+    type: Literal["dispose"]
+    op_no: str = Field(min_length=1)
+    items: list[DisposeItemIn] = Field(min_length=1)
+    operator: Optional[str] = Field(default=None, description="销毁操作者(审计展示)")
+    location: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _check_items(self) -> "DisposeOp":
+        ids = [i.sample_id for i in self.items]
+        if len(ids) != len(set(ids)):
+            raise ValueError("items 中存在重复 sample_id")
+        return self
+
+
 AnyOp = Annotated[
-    Union[SamplingOp, AliquotOp, MergeOp],
+    Union[SamplingOp, AliquotOp, MergeOp, DisposeOp],
     Field(discriminator="type"),
 ]
 
@@ -105,12 +130,30 @@ class EdgeOut(BaseModel):
     unit: str
 
 
+class DisposeItemOut(BaseModel):
+    sample_id: str
+    amount: float
+    unit: str
+    reason: str
+    remaining: float = Field(description="销毁后的样品余量")
+    reserved: float = Field(description="该样品未释放预留的锁定总量")
+    available: float = Field(description="销毁后的可用量 = 余量 - 未释放预留")
+    from_version: int
+    to_version: int
+
+
 class OpResult(BaseModel):
     op_no: str
-    type: Literal["sampling", "aliquot", "merge"]
+    type: Literal["sampling", "aliquot", "merge", "dispose"]
     samples_created: list[str]
     edges: list[EdgeOut]
     remaining: dict[str, float] = Field(description="操作涉及样品的最新余量")
+    disposed: list[DisposeItemOut] = Field(
+        default_factory=list, description="销毁操作的逐项销毁/报废审计明细(仅 dispose)"
+    )
+    operator: Optional[str] = Field(
+        default=None, description="销毁操作者(仅 dispose)"
+    )
     replayed: bool = Field(default=False, description="True 表示命中幂等,返回的是原结果")
 
 

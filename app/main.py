@@ -31,11 +31,14 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(
     title="科研样品分装追溯 API",
     description=(
-        "取样 / 分装 / 合并操作的事务化追溯服务:\n"
+        "取样 / 分装 / 合并 / 销毁操作的事务化追溯服务:\n"
         "- 每个操作带全局唯一操作号,重复提交幂等返回原结果\n"
         "- 事务内校验父样品余量、禁止谱系环路\n"
         "- 支持批量提交与 dry-run 预校验,冲突返回操作号与批内定位\n"
         "- 按样品回溯完整来源/去向,并提供余量(账本)校验\n"
+        "- 销毁/报废:一次提交多个样品的销毁量与原因,\n"
+        "  单事务按可用量(余量-未释放预留)逐项校验,任一不足整体回滚,\n"
+        "  成功后写不可变销毁审计记录与出库流水并递增样品版本\n"
         "- 预留模块:一个预留号为多个样品分别锁定数量,\n"
         "  单事务校验各样品可用量(余量-未释放预留),全部足够才创建,\n"
         "  支持按预留号幂等重放与整单释放\n"
@@ -44,7 +47,7 @@ app = FastAPI(
         "  确认时单事务二次校验版本、写盘点调整流水并更新余量\n"
         "  (任一项冲突整批不改库存),按批次号幂等重放"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -108,7 +111,7 @@ def _submit_one(
     "/api/v1/operations",
     response_model=s.OpResult,
     tags=["操作"],
-    summary="提交单个取样/分装/合并操作(按 type 区分)",
+    summary="提交单个取样/分装/合并/销毁操作(按 type 区分)",
 )
 def submit_operation(
     op: s.AnyOp, conn: sqlite3.Connection = Depends(get_conn)
@@ -142,6 +145,19 @@ def submit_aliquot(
 )
 def submit_merge(
     op: s.MergeOp, conn: sqlite3.Connection = Depends(get_conn)
+) -> s.OpResult:
+    return _submit_one(conn, op)
+
+
+@app.post(
+    "/api/v1/operations/dispose",
+    response_model=s.OpResult,
+    tags=["操作"],
+    summary="销毁/报废:一次提交多个样品的销毁量与原因,"
+            "单事务按可用量(余量-未释放预留)逐项校验,任一不足整体回滚",
+)
+def submit_dispose(
+    op: s.DisposeOp, conn: sqlite3.Connection = Depends(get_conn)
 ) -> s.OpResult:
     return _submit_one(conn, op)
 

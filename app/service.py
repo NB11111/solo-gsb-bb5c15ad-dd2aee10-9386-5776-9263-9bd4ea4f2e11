@@ -109,6 +109,8 @@ def _stored_result(row: sqlite3.Row, *, replayed: bool) -> s.OpResult:
         samples_created=effect["samples_created"],
         edges=[s.EdgeOut(**e) for e in effect["edges"]],
         remaining=effect["remaining"],
+        disposed=[s.DisposeItemOut(**d) for d in effect.get("disposed", [])],
+        operator=effect.get("operator"),
         replayed=replayed,
     )
 
@@ -123,9 +125,14 @@ class Plan:
     # (sample_id, material, unit, initial_amount, remaining, location, is_root)
     deltas: dict[str, float] = field(default_factory=dict)  # 已存在样品的余量增量
     edges: list[tuple] = field(default_factory=list)        # (parent|None, child, amount, unit)
-    ledger: list[tuple] = field(default_factory=list)      # (sample, direction, amount, unit, edge_idx)
+    ledger: list[tuple] = field(default_factory=list)
+    # (sample, direction, amount, unit, edge_idx|None, is_dispose)
     created: list[str] = field(default_factory=list)
     remaining_view: dict[str, float] = field(default_factory=dict)
+    # 销毁审计明细(sample, amount, unit, reason, from_ver, to_ver,
+    # remaining_after, reserved, available_after),与 ledger 中 dispose 出账一一对应
+    disposes: list[tuple] = field(default_factory=list)
+    operator: Optional[str] = None
 
 
 def _plan_sampling(conn: sqlite3.Connection, op: s.SamplingOp) -> Plan:
@@ -144,7 +151,7 @@ def _plan_sampling(conn: sqlite3.Connection, op: s.SamplingOp) -> Plan:
     )
     p.edges.append((None, op.sample_id, _r(op.amount), op.unit))
     # 取样的 in 流水无父边(edge_id NULL),账本重算时以 initial_amount 计来源
-    p.ledger.append((op.sample_id, "in", _r(op.amount), op.unit, None))
+    p.ledger.append((op.sample_id, "in", _r(op.amount), op.unit, None, False))
     p.created.append(op.sample_id)
     p.remaining_view[op.sample_id] = _r(op.amount)
     return p
@@ -198,8 +205,8 @@ def _plan_aliquot(conn: sqlite3.Connection, op: s.AliquotOp) -> Plan:
              op.location, 0)
         )
         p.edges.append((op.parent_id, part.sample_id, amount, unit))
-        p.ledger.append((op.parent_id, "out", amount, unit, len(p.edges) - 1))
-        p.ledger.append((part.sample_id, "in", amount, unit, len(p.edges) - 1))
+        p.ledger.append((op.parent_id, "out", amount, unit, len(p.edges) - 1, False))
+        p.ledger.append((part.sample_id, "in", amount, unit, len(p.edges) - 1, False))
         p.created.append(part.sample_id)
         p.remaining_view[part.sample_id] = amount
 
@@ -327,8 +334,8 @@ def _plan_merge(conn: sqlite3.Connection, op: s.MergeOp) -> Plan:
     for row, amount in sources:
         p.edges.append((row["sample_id"], op.output_id, amount, unit))
         idx = len(p.edges) - 1
-        p.ledger.append((row["sample_id"], "out", amount, unit, idx))
-        p.ledger.append((op.output_id, "in", amount, unit, idx))
+        p.ledger.append((row["sample_id"], "out", amount, unit, idx, False))
+        p.ledger.append((op.output_id, "in", amount, unit, idx, False))
         p.deltas[row["sample_id"]] = p.deltas.get(row["sample_id"], 0.0) - amount
         p.remaining_view[row["sample_id"]] = _r(row["remaining"] - amount)
 
@@ -364,11 +371,97 @@ def _shortest_path(
     return path
 
 
+def _reserved_map(
+    conn: sqlite3.Connection, sample_ids: list[str]
+) -> dict[str, float]:
+    """各样品未释放预留的锁定总量(与预留模块同口径)。"""
+    out: dict[str, float] = {sid: 0.0 for sid in sample_ids}
+    if not sample_ids:
+        return out
+    qmarks = ",".join("?" * len(sample_ids))
+    rows = conn.execute(
+        f"""SELECT ri.sample_id AS sample_id, SUM(ri.amount) AS reserved
+              FROM reservation_items ri
+              JOIN reservations r ON r.reservation_no = ri.reservation_no
+             WHERE r.status = 'active'
+               AND ri.sample_id IN ({qmarks})
+             GROUP BY ri.sample_id""",
+        sample_ids,
+    ).fetchall()
+    for row in rows:
+        out[row["sample_id"]] = _r(row["reserved"])
+    return out
+
+
+def _plan_dispose(conn: sqlite3.Connection, op: s.DisposeOp) -> Plan:
+    """销毁/报废:单事务内逐项校验「余量 - 未释放预留」,任一不足整单回滚,
+    冲突一次收集全部明细返回。销毁只出库、不产生谱系边。"""
+    ids = list(dict.fromkeys(i.sample_id for i in op.items))  # model 已保证不重复
+    rows = {
+        r["sample_id"]: r
+        for r in conn.execute(
+            f"SELECT * FROM samples WHERE sample_id IN ({','.join('?' * len(ids))})",
+            ids,
+        ).fetchall()
+    }
+    reserved = _reserved_map(conn, ids)
+
+    # 先做全部静态校验(样品存在 + 可用量),收集逐项冲突后一次性抛出
+    conflicts: list[s.Conflict] = []
+    for item in op.items:
+        row = rows.get(item.sample_id)
+        if row is None:
+            conflicts.append(_conflict(
+                "sample_not_found",
+                f"样品 {item.sample_id} 不存在,无法销毁",
+                op=op, sample_id=item.sample_id, requested=_r(item.amount),
+            ))
+            continue
+        remaining = _r(row["remaining"])
+        locked = reserved.get(item.sample_id, 0.0)
+        available = _r(remaining - locked)
+        amount = _r(item.amount)
+        if amount > available + _EPS:
+            conflicts.append(_conflict(
+                "insufficient_available",
+                f"样品 {item.sample_id} 可用量 {available} {row['unit']} 不足,"
+                f"本次销毁需要 {amount} {row['unit']}"
+                f"(当前余量 {remaining},未释放预留 {locked})",
+                op=op, sample_id=item.sample_id,
+                requested=amount, available=available,
+            ))
+    if conflicts:
+        raise ConflictError(conflicts)
+
+    p = Plan(operator=op.operator)
+    for idx, item in enumerate(op.items):
+        row = rows[item.sample_id]
+        amount = _r(item.amount)
+        remaining_after = _r(row["remaining"] - amount)
+        locked = reserved.get(item.sample_id, 0.0)
+        available_after = _r(remaining_after - locked)
+        from_version = row["version"]
+        to_version = from_version + 1
+        p.deltas[item.sample_id] = p.deltas.get(item.sample_id, 0.0) - amount
+        p.ledger.append(
+            (item.sample_id, "out", amount, row["unit"], None, True)
+        )
+        p.disposes.append((
+            item.sample_id, amount, row["unit"], item.reason,
+            from_version, to_version, remaining_after, locked, available_after,
+            idx,
+        ))
+        p.remaining_view[item.sample_id] = remaining_after
+    return p
+
+
 def _build_plan(conn: sqlite3.Connection, op: s.AnyOp) -> Plan:
     if isinstance(op, s.SamplingOp):
         return _plan_sampling(conn, op)
     if isinstance(op, s.AliquotOp):
         return _plan_aliquot(conn, op)
+    if isinstance(op, s.DisposeOp):
+        return _plan_dispose(conn, op)
     return _plan_merge(conn, op)
 
 
@@ -393,10 +486,22 @@ def _persist_plan(
          "amount": amt, "unit": unit}
         for par, ch, amt, unit in plan.edges
     ]
+    disposed_out = [
+        {
+            "sample_id": sid, "amount": amt, "unit": unit, "reason": reason,
+            "remaining": remaining_after, "reserved": locked,
+            "available": available_after,
+            "from_version": from_ver, "to_version": to_ver,
+        }
+        for sid, amt, unit, reason, from_ver, to_ver, remaining_after,
+        locked, available_after, _idx in plan.disposes
+    ]
     effect = {
         "samples_created": plan.created,
         "edges": edges_out,
         "remaining": {k: _r(v) for k, v in plan.remaining_view.items()},
+        "disposed": disposed_out,
+        "operator": plan.operator,
     }
     cur = conn.execute(
         "INSERT INTO operations (op_no, op_type, payload, effect, seq_index,"
@@ -430,20 +535,40 @@ def _persist_plan(
         )
         edge_ids.append(ecur.lastrowid)
 
-    for sid, direction, amt, unit, edge_idx in plan.ledger:
+    dispose_ids: list[int] = []
+    for (sid, amt, unit, reason, from_ver, to_ver, remaining_after,
+         _locked, _available_after, idx) in plan.disposes:
+        dcur = conn.execute(
+            "INSERT INTO dispose_records (op_id, op_no, sample_id, amount, unit,"
+            " reason, operator, seq_index, from_version, to_version,"
+            " remaining_after)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (op_id, op.op_no, sid, amt, unit, reason, plan.operator, idx,
+             from_ver, to_ver, remaining_after),
+        )
+        dispose_ids.append(dcur.lastrowid)
+
+    dispose_pos = 0
+    for sid, direction, amt, unit, edge_idx, is_dispose in plan.ledger:
         edge_id = edge_ids[edge_idx] if edge_idx is not None else None
+        dispose_id = dispose_ids[dispose_pos] if is_dispose else None
+        if is_dispose:
+            dispose_pos += 1
         conn.execute(
-            "INSERT INTO ledger_entries (sample_id, op_id, edge_id, direction,"
-            " amount, unit, ref_no) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (sid, op_id, edge_id, direction, amt, unit, op.op_no),
+            "INSERT INTO ledger_entries (sample_id, op_id, edge_id, dispose_id,"
+            " direction, amount, unit, ref_no)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (sid, op_id, edge_id, dispose_id, direction, amt, unit, op.op_no),
         )
 
     return s.OpResult(
         op_no=op.op_no,
-        type=op.type,
+        type=op.type,  # type: ignore[arg-type]
         samples_created=plan.created,
         edges=[s.EdgeOut(**e) for e in edges_out],
         remaining=effect["remaining"],
+        disposed=[s.DisposeItemOut(**d) for d in disposed_out],
+        operator=plan.operator,
     )
 
 
@@ -707,8 +832,8 @@ def _ledger_remaining(conn: sqlite3.Connection, sample_id: str) -> tuple[float, 
     - 非根样品:Σin − Σout(全部来自谱系转移)
     - 根样品(取样):initial_amount 即外部来源,取样的那条 in 流水与它同源,
       重算时排除,避免双算;之后仍可能被其他样品并入(Σin)。
-    - 盘点调整(stocktake_adjustments.delta,可正可负)作为非谱系流水一并计入,
-      因此实盘确认改账后冗余余量仍可与账本重算对齐。
+    - 销毁(dispose_id 非空的 out 流水,无谱系边)与盘点调整
+      (stocktake_adjustments.delta,可正可负)作为非谱系流水一并计入。
     """
     smp = conn.execute(
         "SELECT initial_amount, is_root FROM samples WHERE sample_id = ?",
@@ -720,7 +845,8 @@ def _ledger_remaining(conn: sqlite3.Connection, sample_id: str) -> tuple[float, 
                   COALESCE(SUM(CASE WHEN direction='out' THEN amount ELSE 0 END),0) AS tout
              FROM ledger_entries
             WHERE sample_id = ?
-              AND NOT (? = 1 AND edge_id IS NULL)""",
+              AND NOT (? = 1 AND edge_id IS NULL AND dispose_id IS NULL
+                       AND direction = 'in')""",
         (sample_id, 1 if is_root else 0),
     ).fetchone()
     adj = conn.execute(

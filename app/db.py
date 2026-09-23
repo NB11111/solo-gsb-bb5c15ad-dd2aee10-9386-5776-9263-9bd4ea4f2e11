@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS samples (
 CREATE TABLE IF NOT EXISTS operations (
     op_id      INTEGER PRIMARY KEY AUTOINCREMENT,
     op_no      TEXT NOT NULL UNIQUE,
-    op_type    TEXT NOT NULL CHECK (op_type IN ('sampling', 'aliquot', 'merge')),
+    op_type    TEXT NOT NULL CHECK (op_type IN ('sampling', 'aliquot', 'merge', 'dispose')),
     payload    TEXT NOT NULL,
     effect     TEXT NOT NULL,
     seq_index  INTEGER NOT NULL,
@@ -37,19 +37,22 @@ CREATE TABLE IF NOT EXISTS operations (
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
--- 出入库流水(余量账本),与谱系边一一对应;sampling 的 in 流水无父边
+-- 出入库流水(余量账本),与谱系边一一对应;sampling 的 in 流水无父边;
+-- dispose 的 out 流水无谱系边而带 dispose_id,指向不可变销毁审计记录
 CREATE TABLE IF NOT EXISTS ledger_entries (
     entry_id     INTEGER PRIMARY KEY AUTOINCREMENT,
     sample_id    TEXT NOT NULL,
     op_id        INTEGER NOT NULL,
     edge_id      INTEGER,
+    dispose_id   INTEGER,
     direction    TEXT NOT NULL CHECK (direction IN ('in', 'out')),
     amount       REAL NOT NULL CHECK (amount >= 0),
     unit         TEXT NOT NULL,
     ref_no       TEXT NOT NULL,
     FOREIGN KEY (sample_id) REFERENCES samples(sample_id),
     FOREIGN KEY (op_id)   REFERENCES operations(op_id),
-    FOREIGN KEY (edge_id) REFERENCES lineage_edges(edge_id)
+    FOREIGN KEY (edge_id) REFERENCES lineage_edges(edge_id),
+    FOREIGN KEY (dispose_id) REFERENCES dispose_records(dispose_id)
 );
 
 -- 谱系边:parent -> child,parent 为 NULL 表示取样(源头)
@@ -172,6 +175,41 @@ CREATE TABLE IF NOT EXISTS stocktake_adjustments (
 
 CREATE INDEX IF NOT EXISTS idx_sadj_stocktake ON stocktake_adjustments(stocktake_no);
 CREATE INDEX IF NOT EXISTS idx_sadj_sample    ON stocktake_adjustments(sample_id);
+
+-- 销毁/报废审计记录:逐项明细,随单事务写入,触发器禁止 UPDATE/DELETE(不可变);
+-- 销毁量同时出库(ledger_entries.direction='out'),不产生谱系边
+CREATE TABLE IF NOT EXISTS dispose_records (
+    dispose_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    op_id        INTEGER NOT NULL,
+    op_no        TEXT NOT NULL,
+    sample_id    TEXT NOT NULL,
+    amount       REAL NOT NULL CHECK (amount > 0),
+    unit         TEXT NOT NULL,
+    reason       TEXT NOT NULL,
+    operator     TEXT,
+    seq_index    INTEGER NOT NULL,
+    from_version INTEGER NOT NULL,
+    to_version   INTEGER NOT NULL,
+    remaining_after REAL NOT NULL CHECK (remaining_after >= 0),
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    FOREIGN KEY (op_id) REFERENCES operations(op_id),
+    FOREIGN KEY (sample_id) REFERENCES samples(sample_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_dispose_op     ON dispose_records(op_no);
+CREATE INDEX IF NOT EXISTS idx_dispose_sample ON dispose_records(sample_id);
+
+CREATE TRIGGER IF NOT EXISTS trg_dispose_no_update
+BEFORE UPDATE ON dispose_records
+BEGIN
+    SELECT RAISE(ABORT, 'dispose_records 不可变:禁止更新销毁审计记录');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_dispose_no_delete
+BEFORE DELETE ON dispose_records
+BEGIN
+    SELECT RAISE(ABORT, 'dispose_records 不可变:禁止删除销毁审计记录');
+END;
 """
 
 
@@ -213,6 +251,13 @@ _MIGRATIONS = (
         "stocktakes",
         "submit_payload",
     ),
+    # 出库流水补销毁审计外键(销毁/报废操作的 out 流水无谱系边,以此关联审计明细)
+    (
+        "ledger_entries_add_dispose_id",
+        "ALTER TABLE ledger_entries ADD COLUMN dispose_id INTEGER",
+        "ledger_entries",
+        "dispose_id",
+    ),
 )
 
 
@@ -234,6 +279,58 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute(
             "INSERT OR IGNORE INTO schema_migrations (name) VALUES (?)", (name,)
         )
+    _migrate_operations_add_dispose(conn)
+
+
+def _migrate_operations_add_dispose(conn: sqlite3.Connection) -> None:
+    """旧库 operations 的 op_type CHECK 不含 dispose,SQLite 无法改 CHECK,
+    需按 12 步表重建流程换表(外键关闭/恢复,数据原样拷贝)。"""
+    name = "operations_add_dispose_type"
+    done = conn.execute(
+        "SELECT 1 FROM schema_migrations WHERE name = ?", (name,)
+    ).fetchone()
+    if done is not None:
+        return
+    # 新库(_SCHEMA 已含 dispose 的 CHECK)无需重建
+    sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'operations'"
+    ).fetchone()["sql"]
+    if "'dispose'" in sql:
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (name) VALUES (?)", (name,)
+        )
+        return
+
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        conn.execute("BEGIN")
+        conn.execute(
+            "CREATE TABLE operations_new ("
+            " op_id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " op_no TEXT NOT NULL UNIQUE,"
+            " op_type TEXT NOT NULL CHECK"
+            " (op_type IN ('sampling', 'aliquot', 'merge', 'dispose')),"
+            " payload TEXT NOT NULL, effect TEXT NOT NULL, seq_index INTEGER NOT NULL,"
+            " batch_id TEXT, location TEXT,"
+            " created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))"
+        )
+        conn.execute(
+            "INSERT INTO operations_new (op_id, op_no, op_type, payload, effect,"
+            " seq_index, batch_id, location, created_at)"
+            " SELECT op_id, op_no, op_type, payload, effect, seq_index, batch_id,"
+            " location, created_at FROM operations"
+        )
+        conn.execute("DROP TABLE operations")
+        conn.execute("ALTER TABLE operations_new RENAME TO operations")
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (name) VALUES (?)", (name,)
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
 
 
 def get_conn(db_path: str | None = None) -> Generator[sqlite3.Connection, None, None]:

@@ -1,6 +1,6 @@
 # 科研样品分装追溯 API
 
-基于 **FastAPI + SQLite** 的科研样品谱系(lineage)追溯服务。支持样品的**取样、分装、合并**三类操作,在数据库事务中完成余量校验与环路检测,并通过唯一操作号实现**幂等提交**;可按任意样品回溯完整来源与去向,并对余量账本做一致性校验。此外提供两个扩展模块:**预留模块**——客户端可用一个预留号为多个样品分别锁定数量,服务在同一事务中校验各样品可用余量(当前余量减去未释放预留),全部足够才一次创建,支持按预留号幂等重放、整单释放与可用量查询;**盘点模块**——按样品编号集合建批保存余量/版本快照,提交实盘结果时逐项乐观锁校验数据库余量未被其他操作改变并计算系统量与实盘量差异,确认时在单事务内再次校验版本、写入盘点调整流水并更新样品余量(任一项冲突则整批不改库存),按盘点批次号支持同请求幂等重放与不同内容冲突。
+基于 **FastAPI + SQLite** 的科研样品谱系(lineage)追溯服务。支持样品的**取样、分装、合并、销毁/报废**四类操作,在数据库事务中完成余量(销毁按可用量)校验与环路检测,并通过唯一操作号实现**幂等提交**;可按任意样品回溯完整来源与去向,并对余量账本做一致性校验。销毁操作允许一次提交多个样品的销毁量与原因,服务在单事务内按当前可用量(余量减未释放预留)逐项校验,任一不足则整体回滚并返回逐项冲突,成功后写入不可变销毁审计记录与出库流水并递增样品版本,同时接入批量提交与 dry-run 预校验。此外提供两个扩展模块:**预留模块**——客户端可用一个预留号为多个样品分别锁定数量,服务在同一事务中校验各样品可用余量(当前余量减去未释放预留),全部足够才一次创建,支持按预留号幂等重放、整单释放与可用量查询;**盘点模块**——按样品编号集合建批保存余量/版本快照,提交实盘结果时逐项乐观锁校验数据库余量未被其他操作改变并计算系统量与实盘量差异,确认时在单事务内再次校验版本、写入盘点调整流水并更新样品余量(任一项冲突则整批不改库存),按盘点批次号支持同请求幂等重放与不同内容冲突。
 
 ## 一键启动
 
@@ -38,6 +38,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 取样 sampling | 从外部获得全新**根样品**,记录来源边(`parent=null`)与入库流水 |
 | 分装 aliquot | 一个父样品拆成若干**新**子样品;总取出量不得超过父样品余量 |
 | 合并 merge | 多个来源(可部分取用)汇入输出;输出可为新样品或已有样品;支持守恒校验 |
+| 销毁 dispose | 一次提交多个样品的**销毁量与原因**;逐项按可用量(余量−未释放预留)校验,只出库、不产生谱系边 |
+| 销毁审计记录 | 销毁成功即逐项写入不可变表 `dispose_records`(销毁量、单位、原因、操作者、前后版本、销毁后余量),触发器禁止 UPDATE/DELETE |
 | 谱系边 | 每次转移记录 `parent → child`、数量、单位与操作号,构成可追溯有向无环图 |
 | 出入库流水 | 与谱系边对应的 in/out 账本,余量可随时按流水重算审计 |
 | 预留单 | 一个预留号(`reservation_no`)为多个样品分别锁定数量;`active`=锁定中,`released`=已整单释放 |
@@ -62,6 +64,14 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - `DELETE` 整单释放后锁定量立即归还,可被新预留使用;重复释放幂等;预留明细在释放后保留作为审计痕迹。
 - 预留不改动样品余量与出入库流水,仅通过"未释放预留合计"影响可用量。
 
+**销毁/报废事务保证**
+
+- 销毁请求一次给出多个样品明细(每项销毁量与原因必填),服务在单个 `BEGIN IMMEDIATE` 事务内**逐项校验可用量 = 当前余量 − 未释放预留**;任一样品不足(或不存在)即**整单回滚**,响应 `conflicts[]` 一次返回全部冲突明细(含各项 `requested`/`available`),不更新任何余量、不写任何审计记录。
+- 校验全部通过后:逐项写入出库流水(`ledger_entries`,方向 `out`,经 `dispose_id` 关联审计记录)与**不可变销毁审计记录** `dispose_records`(样品、销毁量、单位、原因、操作者、销毁前后版本、销毁后余量;数据库触发器禁止 UPDATE/DELETE),样品余量扣减且**版本 +1**。
+- 销毁不产生谱系边、不创建样品;销毁出账纳入余量账本重算,销毁后 `/api/v1/checks/balances` 仍保持一致。
+- **幂等**:同一操作号 + 同一请求体重放返回首次结果(`replayed: true`),不重复出库;同号不同内容返回 `409 op_no_conflict`。
+- dispose 可与其他类型一起走 `/api/v1/batch`(整批一个事务,后续操作可见前面销毁后的余量),并支持 `/api/v1/validate`、`/api/v1/batch/validate` dry-run(冲突带批内下标,不写主库)。
+
 **盘点事务保证**
 
 - **建批(open)**:按样品编号集合在单个 `BEGIN IMMEDIATE` 事务内逐项保存「系统余量 / 单位 / 版本」快照;任一样品不存在则整批不建。
@@ -79,7 +89,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/api/v1/operations/sampling` | 取样 |
 | POST | `/api/v1/operations/aliquot` | 分装 |
 | POST | `/api/v1/operations/merge` | 合并 |
-| POST | `/api/v1/batch` | 批量操作,单事务提交;`status` 为 `committed`/`replayed`/`mixed` |
+| POST | `/api/v1/operations/dispose` | 销毁/报废:一次提交多个样品的销毁量与原因,单事务逐项校验可用量 |
+| POST | `/api/v1/batch` | 批量操作(含 dispose),单事务提交;`status` 为 `committed`/`replayed`/`mixed` |
 | POST | `/api/v1/validate` | 单操作 dry-run 预校验(不写库) |
 | POST | `/api/v1/batch/validate` | 批量 dry-run 预校验,冲突带 `batch_index` 定位 |
 | GET  | `/api/v1/samples` | 样品列表(分页) |
@@ -348,6 +359,49 @@ curl -X POST http://localhost:8000/api/v1/stocktakes/STK-20260923-001/confirm \
 
 **查询批次**(`GET /api/v1/stocktakes/STK-20260923-001`)在任意阶段返回快照、实盘量与差异、确认状态,以及每样品查询时刻的余量/版本和 `version_drift`(快照后是否已被其他操作改变);已确认时还返回调整流水。盘点调整纳入余量账本,`/api/v1/checks/balances` 的 `adjustments` 字段给出各样品调整合计。
 
+### 12. 销毁/报废:多明细单事务提交
+
+一次提交多个样品的销毁量与原因(每项 `reason` 必填),服务按**可用量(余量 − 未释放预留)**逐项校验:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/operations/dispose \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "type": "dispose",
+    "op_no": "DSP-20260923-001",
+    "operator": "孙七",
+    "location": "危废暂存柜",
+    "items": [
+      {"sample_id": "S0", "amount": 5,  "reason": "交叉污染"},
+      {"sample_id": "A2", "amount": 10, "reason": "过期报废"}
+    ]
+  }'
+```
+
+全部明细可用量足够才提交:逐项出库并写不可变销毁审计记录、余量扣减且版本 +1,响应给出每样品销毁后的余量/已预留/可用量与前后版本:
+
+```json
+{
+  "op_no": "DSP-20260923-001",
+  "type": "dispose",
+  "samples_created": [],
+  "edges": [],
+  "remaining": {"S0": 5.0, "A2": 20.0},
+  "disposed": [
+    {"sample_id": "S0", "amount": 5.0, "unit": "mL", "reason": "交叉污染",
+     "remaining": 5.0, "reserved": 0.0, "available": 5.0,
+     "from_version": 2, "to_version": 3},
+    {"sample_id": "A2", "amount": 10.0, "unit": "mL", "reason": "过期报废",
+     "remaining": 20.0, "reserved": 0.0, "available": 20.0,
+     "from_version": 1, "to_version": 2}
+  ],
+  "operator": "孙七",
+  "replayed": false
+}
+```
+
+任一样品可用量不足(或不存在)时返回 `409`,`conflicts[]` 中**一次列出全部问题明细**(可含多条 `insufficient_available` 与 `sample_not_found`),整单回滚、余量与审计均不变。同一操作号用相同请求体重放返回首次结果且 `replayed: true`;同号不同内容返回 `409 op_no_conflict`。销毁同样支持 `/api/v1/batch`(可与取样/分装/合并混批,任一冲突整批回滚)、`/api/v1/validate` 与 `/api/v1/batch/validate`(不写库,冲突带 `batch_index`)。销毁后 `/api/v1/checks/balances` 仍为一致(销毁量计入各样品 `total_out`)。
+
 ## 冲突码
 
 | code | 含义 |
@@ -363,7 +417,7 @@ curl -X POST http://localhost:8000/api/v1/stocktakes/STK-20260923-001/confirm \
 | `op_no_conflict` | 操作号已存在但请求内容不同(幂等键冲突) |
 | `duplicate_op_no_in_batch` | 同一批次内操作号重复,附 `batch_index` |
 | `balance_inconsistent` | 余量账本重算与冗余余量不一致 |
-| `insufficient_available` | 预留可用量不足(当前余量−未释放预留),附 `requested`/`available` |
+| `insufficient_available` | 预留/销毁可用量不足(当前余量−未释放预留),附 `requested`/`available` |
 | `reservation_no_conflict` | 预留号已存在但请求内容不同 |
 | `reservation_closed` | 预留号已释放,不能再次创建 |
 | `reservation_not_found` | 预留号不存在(查询/释放时返回 HTTP 404) |
@@ -388,14 +442,15 @@ python -m pytest -q
 ```
 app/
   config.py        # 数据库路径、容差等配置
-  db.py            # SQLite 连接 / 建表 / 增量迁移(WAL、外键、CHECK 约束、预留与盘点表)
-  schemas.py       # Pydantic 请求与响应模型(含冲突结构、预留与盘点模型)
-  service.py       # 核心:事务提交、余量/环路校验、幂等回放、dry-run、递归回溯、账本审计
+  db.py            # SQLite 连接 / 建表 / 增量迁移(WAL、外键、CHECK 约束、预留/盘点/销毁表)
+  schemas.py       # Pydantic 请求与响应模型(含冲突结构、预留、盘点与销毁模型)
+  service.py       # 核心:事务提交、余量/可用量/环路校验、销毁审计、幂等回放、dry-run、递归回溯、账本审计
   reservations.py  # 预留:单事务多样品锁定、幂等重放、整单释放、可用量查询、事件审计
   stocktakes.py    # 盘点:快照建批、提交版本校验与差异、确认二次校验后整批原子调账
   main.py          # FastAPI 路由
 tests/
   test_api.py          # 操作链路端到端测试(TestClient)
+  test_disposals.py    # 销毁/报废:可用量校验、整单回滚、不可变审计、幂等、批量与 dry-run
   test_reservations.py # 预留模块端到端/并发/审计测试
   test_stocktakes.py   # 盘点工作流端到端/并发确认/旧库迁移测试
 Dockerfile
