@@ -72,8 +72,36 @@ class MergeOp(BaseModel):
         return self
 
 
+class DisposeItem(BaseModel):
+    """销毁明细:对指定样品报废 amount,单位沿用样品主数据;原因必填(审计)。"""
+
+    sample_id: str = Field(min_length=1)
+    amount: Amount
+    reason: str = Field(min_length=1, description="销毁/报废原因(审计必填)")
+
+
+class DisposeOp(BaseModel):
+    """销毁/报废:一次提交多个样品的销毁量与原因,整单原子生效。
+
+    按「当前余量 − 未释放预留」逐项校验可用量,任一不足则整单回滚;
+    成功后写不可变销毁审计记录与出库流水,并递增样品版本。
+    """
+
+    type: Literal["dispose"]
+    op_no: str = Field(min_length=1)
+    items: list[DisposeItem] = Field(min_length=1)
+    location: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _check_items(self) -> "DisposeOp":
+        ids = [i.sample_id for i in self.items]
+        if len(ids) != len(set(ids)):
+            raise ValueError("items 中存在重复 sample_id")
+        return self
+
+
 AnyOp = Annotated[
-    Union[SamplingOp, AliquotOp, MergeOp],
+    Union[SamplingOp, AliquotOp, MergeOp, DisposeOp],
     Field(discriminator="type"),
 ]
 
@@ -105,12 +133,22 @@ class EdgeOut(BaseModel):
     unit: str
 
 
+class DisposeOut(BaseModel):
+    sample_id: str
+    amount: float
+    unit: str
+    reason: str
+
+
 class OpResult(BaseModel):
     op_no: str
-    type: Literal["sampling", "aliquot", "merge"]
+    type: Literal["sampling", "aliquot", "merge", "dispose"]
     samples_created: list[str]
     edges: list[EdgeOut]
     remaining: dict[str, float] = Field(description="操作涉及样品的最新余量")
+    disposed: list[DisposeOut] = Field(
+        default_factory=list, description="销毁明细(仅 dispose 操作非空)"
+    )
     replayed: bool = Field(default=False, description="True 表示命中幂等,返回的是原结果")
 
 
@@ -120,6 +158,18 @@ class BatchResponse(BaseModel):
         description="committed=全部新提交;replayed=全部重复操作号回放;mixed=两者混合"
     )
     results: list[OpResult]
+
+
+class DisposalRecordOut(BaseModel):
+    """销毁审计记录(不可变):逐项记录样品、销毁量、原因与操作号。"""
+
+    op_no: str
+    sample_id: str
+    amount: float
+    unit: str
+    reason: str
+    location: Optional[str] = None
+    created_at: str
 
 
 # ---------------------------------------------------------------- 谱系回溯

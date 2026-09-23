@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS samples (
 CREATE TABLE IF NOT EXISTS operations (
     op_id      INTEGER PRIMARY KEY AUTOINCREMENT,
     op_no      TEXT NOT NULL UNIQUE,
-    op_type    TEXT NOT NULL CHECK (op_type IN ('sampling', 'aliquot', 'merge')),
+    op_type    TEXT NOT NULL CHECK (op_type IN ('sampling', 'aliquot', 'merge', 'dispose')),
     payload    TEXT NOT NULL,
     effect     TEXT NOT NULL,
     seq_index  INTEGER NOT NULL,
@@ -69,6 +69,38 @@ CREATE TABLE IF NOT EXISTS lineage_edges (
 CREATE INDEX IF NOT EXISTS idx_edges_parent ON lineage_edges(parent_id);
 CREATE INDEX IF NOT EXISTS idx_edges_child  ON lineage_edges(child_id);
 CREATE INDEX IF NOT EXISTS idx_ledger_sample ON ledger_entries(sample_id);
+
+-- 销毁审计记录:dispose 操作逐项落库,只增不改不删(由触发器强制不可变)
+CREATE TABLE IF NOT EXISTS dispose_records (
+    record_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+    op_no      TEXT NOT NULL,
+    op_id      INTEGER NOT NULL,
+    sample_id  TEXT NOT NULL,
+    amount     REAL NOT NULL CHECK (amount > 0),
+    unit       TEXT NOT NULL,
+    reason     TEXT NOT NULL,
+    seq_index  INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    FOREIGN KEY (op_id)     REFERENCES operations(op_id),
+    FOREIGN KEY (sample_id) REFERENCES samples(sample_id),
+    UNIQUE (op_no, sample_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_dispose_sample ON dispose_records(sample_id);
+CREATE INDEX IF NOT EXISTS idx_dispose_op     ON dispose_records(op_no);
+
+-- 不可变约束:审计记录禁止 UPDATE / DELETE
+CREATE TRIGGER IF NOT EXISTS trg_dispose_records_no_update
+BEFORE UPDATE ON dispose_records
+BEGIN
+    SELECT RAISE(ABORT, 'dispose_records is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_dispose_records_no_delete
+BEFORE DELETE ON dispose_records
+BEGIN
+    SELECT RAISE(ABORT, 'dispose_records is immutable');
+END;
 
 -- 预留单:一个预留号为多个样品分别锁定数量;active=锁定中,released=已整单释放
 CREATE TABLE IF NOT EXISTS reservations (
@@ -231,6 +263,68 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # 此处连接为 isolation_level=None(autocommit),逐条执行即可
         if not _column_exists(conn, table, column):
             conn.execute(ddl)
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (name) VALUES (?)", (name,)
+        )
+    _migrate_operations_allow_dispose(conn)
+
+
+# 重建后的 operations 表结构(op_type CHECK 放行 'dispose');
+# 先用新名建新表,拷贝后删旧表再改名,避免 RENAME 改写其他表的外键引用
+_OPERATIONS_DDL = """
+CREATE TABLE operations_rebuilt (
+    op_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    op_no      TEXT NOT NULL UNIQUE,
+    op_type    TEXT NOT NULL CHECK (op_type IN ('sampling', 'aliquot', 'merge', 'dispose')),
+    payload    TEXT NOT NULL,
+    effect     TEXT NOT NULL,
+    seq_index  INTEGER NOT NULL,
+    batch_id   TEXT,
+    location   TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+)
+"""
+
+
+def _migrate_operations_allow_dispose(conn: sqlite3.Connection) -> None:
+    """旧库 operations 表的 CHECK 不含 'dispose',按 SQLite 官方流程重建表放宽约束。
+
+    建新表(临时名)→ 拷贝 → 删旧表 → 改名为 operations;op_id 保持不变,
+    ledger/谱系/销毁审计的外键引用不受影响。迁移幂等:已在 schema_migrations
+    登记或表结构已含 'dispose' 时直接跳过。
+    """
+    name = "operations_allow_dispose"
+    done = conn.execute(
+        "SELECT 1 FROM schema_migrations WHERE name = ?", (name,)
+    ).fetchone()
+    if done is not None:
+        return
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'operations'"
+    ).fetchone()
+    if row is not None and "'dispose'" not in (row["sql"] or ""):
+        conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            conn.execute("BEGIN")
+            conn.execute(_OPERATIONS_DDL)
+            conn.execute(
+                "INSERT INTO operations_rebuilt (op_id, op_no, op_type, payload,"
+                " effect, seq_index, batch_id, location, created_at)"
+                " SELECT op_id, op_no, op_type, payload, effect, seq_index,"
+                " batch_id, location, created_at FROM operations"
+            )
+            conn.execute("DROP TABLE operations")
+            conn.execute("ALTER TABLE operations_rebuilt RENAME TO operations")
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations (name) VALUES (?)", (name,)
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.execute("PRAGMA foreign_keys = ON")
+    else:
         conn.execute(
             "INSERT OR IGNORE INTO schema_migrations (name) VALUES (?)", (name,)
         )

@@ -31,11 +31,14 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(
     title="科研样品分装追溯 API",
     description=(
-        "取样 / 分装 / 合并操作的事务化追溯服务:\n"
+        "取样 / 分装 / 合并 / 销毁操作的事务化追溯服务:\n"
         "- 每个操作带全局唯一操作号,重复提交幂等返回原结果\n"
         "- 事务内校验父样品余量、禁止谱系环路\n"
         "- 支持批量提交与 dry-run 预校验,冲突返回操作号与批内定位\n"
         "- 按样品回溯完整来源/去向,并提供余量(账本)校验\n"
+        "- 销毁/报废:一次提交多个样品的销毁量与原因,单事务按\n"
+        "  可用量(余量-未释放预留)逐项校验,任一不足整体回滚;\n"
+        "  成功后写不可变销毁审计记录与出库流水并递增样品版本\n"
         "- 预留模块:一个预留号为多个样品分别锁定数量,\n"
         "  单事务校验各样品可用量(余量-未释放预留),全部足够才创建,\n"
         "  支持按预留号幂等重放与整单释放\n"
@@ -142,6 +145,19 @@ def submit_aliquot(
 )
 def submit_merge(
     op: s.MergeOp, conn: sqlite3.Connection = Depends(get_conn)
+) -> s.OpResult:
+    return _submit_one(conn, op)
+
+
+@app.post(
+    "/api/v1/operations/dispose",
+    response_model=s.OpResult,
+    tags=["操作"],
+    summary="销毁/报废:一次提交多个样品的销毁量与原因,单事务校验可用量,"
+            "任一不足整体回滚;成功后写不可变审计记录与出库流水",
+)
+def submit_dispose(
+    op: s.DisposeOp, conn: sqlite3.Connection = Depends(get_conn)
 ) -> s.OpResult:
     return _submit_one(conn, op)
 
@@ -346,6 +362,47 @@ def get_operation(
         "seq_index": row["seq_index"],
         "location": row["location"],
         "created_at": row["created_at"],
+    }
+
+
+@app.get(
+    "/api/v1/disposals",
+    tags=["查询"],
+    summary="销毁审计记录(不可变):可按样品过滤,逐项含操作号/销毁量/原因",
+)
+def list_disposals(
+    sample_id: Optional[str] = Query(default=None, description="按样品过滤,不传返回全部"),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> dict:
+    where = "WHERE d.sample_id = ?" if sample_id else ""
+    params: tuple = (sample_id,) if sample_id else ()
+    rows = conn.execute(
+        f"""SELECT d.*, o.location AS location
+              FROM dispose_records d
+              JOIN operations o ON o.op_id = d.op_id
+              {where}
+             ORDER BY d.record_id LIMIT ? OFFSET ?""",
+        (*params, limit, offset),
+    ).fetchall()
+    total = conn.execute(
+        f"SELECT COUNT(*) AS c FROM dispose_records d {where}", params
+    ).fetchone()["c"]
+    return {
+        "total": total,
+        "items": [
+            s.DisposalRecordOut(
+                op_no=r["op_no"],
+                sample_id=r["sample_id"],
+                amount=r["amount"],
+                unit=r["unit"],
+                reason=r["reason"],
+                location=r["location"],
+                created_at=r["created_at"],
+            ).model_dump()
+            for r in rows
+        ],
     }
 
 
